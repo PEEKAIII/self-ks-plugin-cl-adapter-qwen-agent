@@ -1,0 +1,266 @@
+import {
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    ChatMessageChunk,
+    FunctionMessageChunk,
+    HumanMessageChunk,
+    MessageContentImageUrl,
+    MessageType,
+    SystemMessageChunk,
+    ToolMessage,
+    ToolMessageChunk
+} from '@langchain/core/messages'
+import { StructuredTool } from '@langchain/core/tools'
+import { zodToJsonSchema } from 'zod-to-json-schema'
+import { isMessageContentImageUrl } from 'koishi-plugin-chatluna/utils/string'
+import {
+    ChatCompletionResponseMessage,
+    ChatCompletionResponseMessageRoleEnum,
+    ChatCompletionTool
+} from './types'
+import {
+    fetchImageUrl,
+    removeAdditionalProperties,
+    supportImageInput
+} from '@chatluna/v1-shared-adapter'
+import { ChatLunaPlugin } from 'koishi-plugin-chatluna/services/chat'
+import { isZodSchemaV3 } from '@langchain/core/utils/types'
+
+export function formatToolsToQWenTools(
+    tools: StructuredTool[]
+): ChatCompletionTool[] {
+    if (tools.length < 1) {
+        return undefined
+    }
+    return tools.map(formatToolToQWenTool)
+}
+
+export function formatToolToQWenTool(tool: StructuredTool): ChatCompletionTool {
+    const parameters = removeAdditionalProperties(
+        isZodSchemaV3(tool.schema)
+            ? zodToJsonSchema(tool.schema as never, {
+                  allowedAdditionalProperties: undefined
+              })
+            : tool.schema
+    )
+
+    return {
+        type: 'function',
+        function: {
+            name: tool.name,
+            description: tool.description,
+            // any?
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            parameters
+        }
+    }
+}
+
+export async function langchainMessageToQWenMessage(
+    messages: BaseMessage[],
+    plugin: ChatLunaPlugin,
+    model: string
+): Promise<ChatCompletionResponseMessage[]> {
+    const result: ChatCompletionResponseMessage[] = []
+
+    for (const rawMessage of messages) {
+        const role = messageTypeToQWenRole(rawMessage.getType())
+
+        const msg = {
+            content: (rawMessage.content as string) || null,
+            name:
+                role === 'assistant' || role === 'tool'
+                    ? rawMessage.name
+                    : undefined,
+            role,
+
+            tool_call_id: (rawMessage as ToolMessage).tool_call_id
+        } as ChatCompletionResponseMessage
+
+        if (rawMessage.getType() === 'ai') {
+            const toolCalls = (rawMessage as AIMessage).tool_calls
+
+            if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+                msg.tool_calls = toolCalls.map((toolCall) => ({
+                    id: toolCall.id,
+                    type: 'function',
+                    function: {
+                        name: toolCall.name,
+                        arguments: JSON.stringify(toolCall.args)
+                    }
+                }))
+            }
+        }
+
+        if (msg.tool_calls == null) {
+            delete msg.tool_calls
+        }
+
+        if (msg.tool_call_id == null) {
+            delete msg.tool_call_id
+        }
+
+        if (msg.tool_calls) {
+            for (const toolCall of msg.tool_calls) {
+                const tool = toolCall.function
+
+                if (!tool.arguments) {
+                    continue
+                }
+                // Remove spaces, new line characters etc.
+                tool.arguments = JSON.stringify(JSON.parse(tool.arguments))
+            }
+        }
+
+        const images = rawMessage.additional_kwargs.images as string[] | null
+
+        if (
+            (model?.includes('qwen-vl') ||
+                model?.includes('omni') ||
+                model?.includes('qwen2.5-vl') ||
+                model?.includes('qwen2.5-omni') ||
+                model?.includes('qwen-omni') ||
+                model?.includes('qwen2-vl') ||
+                model?.includes('qvq') ||
+                supportImageInput(model)) &&
+            images != null
+        ) {
+            msg.content = [
+                {
+                    type: 'text',
+                    text: rawMessage.content as string
+                }
+            ]
+
+            const imageContents = await Promise.all(
+                images.map(async (image) => {
+                    try {
+                        const url = await fetchImageUrl(plugin, {
+                            type: 'image_url',
+                            image_url: { url: image }
+                        } as MessageContentImageUrl)
+                        return {
+                            type: 'image_url',
+                            image_url: {
+                                url,
+                                detail: 'low'
+                            }
+                        } as const
+                    } catch {
+                        return null
+                    }
+                })
+            )
+
+            msg.content.push(
+                ...imageContents.filter((content) => content != null)
+            )
+        } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+            const mappedContent = await Promise.all(
+                msg.content.map(async (content) => {
+                    if (!isMessageContentImageUrl(content)) return content
+
+                    try {
+                        const url = await fetchImageUrl(plugin, content)
+                        return {
+                            type: 'image_url',
+                            image_url: {
+                                url,
+                                detail: 'low'
+                            }
+                        } as const
+                    } catch {
+                        return null
+                    }
+                })
+            )
+
+            msg.content = mappedContent.filter((content) => content != null)
+        }
+
+        result.push(msg)
+    }
+
+    return result
+}
+
+export function messageTypeToQWenRole(
+    type: MessageType
+): ChatCompletionResponseMessageRoleEnum {
+    switch (type) {
+        case 'system':
+            return 'system'
+        case 'ai':
+            return 'assistant'
+        case 'human':
+            return 'user'
+        case 'function':
+            return 'function'
+        case 'tool':
+            return 'tool'
+        default:
+            throw new Error(`Unknown message type: ${type}`)
+    }
+}
+
+export function convertDeltaToMessageChunk(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delta: Record<string, any>,
+    defaultRole?: ChatCompletionResponseMessageRoleEnum
+) {
+    const role = (
+        (delta.role?.length ?? 0) > 0 ? delta.role : defaultRole
+    ).toLowerCase()
+    const content = delta.content ?? ''
+    const reasoningContent = delta.reasoning_content ?? ''
+
+    const additionalKwargs: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/naming-convention
+        function_call?: any
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/naming-convention
+        tool_calls?: any
+        reasoning_content?: string
+    } = {}
+
+    if (reasoningContent.length > 0) {
+        additionalKwargs.reasoning_content = reasoningContent
+    }
+
+    if (role === 'user') {
+        return new HumanMessageChunk({ content })
+    } else if (role === 'assistant') {
+        const toolCallChunks = []
+        if (Array.isArray(delta.tool_calls)) {
+            for (const rawToolCall of delta.tool_calls) {
+                toolCallChunks.push({
+                    name: rawToolCall.function?.name,
+                    args: rawToolCall.function?.arguments,
+                    id: rawToolCall.id,
+                    index: rawToolCall.index
+                })
+            }
+        }
+        return new AIMessageChunk({
+            content,
+            tool_call_chunks: toolCallChunks,
+            additional_kwargs: additionalKwargs
+        })
+    } else if (role === 'system') {
+        return new SystemMessageChunk({ content })
+    } else if (role === 'function') {
+        return new FunctionMessageChunk({
+            content,
+            additional_kwargs: additionalKwargs,
+            name: delta.name
+        })
+    } else if (role === 'tool') {
+        return new ToolMessageChunk({
+            content,
+            additional_kwargs: additionalKwargs,
+            tool_call_id: delta.tool_call_id
+        })
+    } else {
+        return new ChatMessageChunk({ content, role })
+    }
+}

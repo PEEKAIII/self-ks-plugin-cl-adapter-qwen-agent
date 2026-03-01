@@ -1,0 +1,33 @@
+$inner:
+    - {}
+    - $desc: 'API Configuration'
+      apiKeys:
+          $inner:
+              - 'Tongyi Qianwen API Key'
+              - 'API Endpoint (optional)'
+              - 'Enabled'
+          $desc: 'Tongyi Qianwen API Keys'
+      additionalModels:
+          $desc: 'Additional models'
+          $inner:
+              model: 'Model name'
+              modelType: 'Model type'
+              contextSize: 'Context size'
+              modelCapabilities:
+                $desc: Model supported capabilities
+                $inner:
+                    - Tool calling
+                    - Visual image input
+
+
+    - $desc: 'Model Parameters'
+      maxContextRatio: 'Maximum context usage ratio (0-1). Controls the maximum percentage of model context window available for use. For example, 0.35 means at most 35% of the model context can be used.'
+      temperature: 'Sampling temperature (higher values increase randomness)'
+      enableSearch: 'Enable built-in Quark search'
+
+    # Agent 2.0 Configuration Translations
+    - $desc: 'Agent 2.0 Configuration'
+      agentId: 'Agent App ID (New Version)'
+      workspaceId: 'Workspace ID (Legacy, Not Required for New API)'
+      agentApiEndpoint: 'Agent API Endpoint (Leave blank for new default)'
+      threadCacheTime: 'Thread Cache Duration (seconds)'
