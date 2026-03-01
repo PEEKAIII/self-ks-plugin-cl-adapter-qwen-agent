@@ -28,6 +28,8 @@ export class QWenRequester
     extends ModelRequester
     implements EmbeddingsRequester
 {
+    private _sessionCache: Map<string, { sessionId: string; lastAccess: number }> = new Map()
+
     constructor(
         ctx: Context,
         _configPool: ClientConfigPool<ClientConfig>,
@@ -35,6 +37,30 @@ export class QWenRequester
         _plugin: ChatLunaPlugin
     ) {
         super(ctx, _configPool, _pluginConfig, _plugin)
+    }
+
+    private _getSessionKey(messages: { content?: string | unknown[] }[]): string {
+        const firstMsg = messages[0]
+        if (!firstMsg) return 'default'
+        const content = typeof firstMsg.content === 'string' 
+            ? firstMsg.content 
+            : JSON.stringify(firstMsg.content)
+        return content.slice(0, 64)
+    }
+
+    private _getSessionId(key: string): string | undefined {
+        const cached = this._sessionCache.get(key)
+        if (!cached) return undefined
+        const cacheTime = this._pluginConfig.threadCacheTime * 1000
+        if (Date.now() - cached.lastAccess > cacheTime) {
+            this._sessionCache.delete(key)
+            return undefined
+        }
+        return cached.sessionId
+    }
+
+    private _setSessionId(key: string, sessionId: string): void {
+        this._sessionCache.set(key, { sessionId, lastAccess: Date.now() })
     }
 
     async *completionStreamInternal(
@@ -123,16 +149,21 @@ export class QWenRequester
             this
         )
 
-        let sessionId: string | undefined
-
         try {
             const baseRequest = await buildChatCompletionParams(params, this._plugin, false, false)
             const agentId = this._pluginConfig.agentId
 
+            const sessionKey = this._getSessionKey(baseRequest.messages)
+            let sessionId = this._getSessionId(sessionKey)
+
+            // ========== 问题3修复: messages → prompt 转换 ==========
+            // 官方 API 要求传入 prompt 字符串，但 chatluna 传递的是 messages 数组
+            // 需要提取最后一条消息的内容作为 prompt
             const lastMessage = baseRequest.messages[baseRequest.messages.length - 1]
             const prompt = typeof lastMessage.content === 'string'
                 ? lastMessage.content
                 : lastMessage.content.map((c: { text?: string }) => c.text || '').join('')
+            // =====================================================
 
             const agentRequest = {
                 input: {
@@ -143,15 +174,13 @@ export class QWenRequester
                 debug: {}
             }
 
-            // 2. 拼接正确的请求地址（使用 dashscope 域名）
             const url = `https://dashscope.aliyuncs.com/api/v1/apps/${agentId}/completion`
-            // 从 apiKeys 数组中获取第一个启用的 API Key
             const apiKey = this._pluginConfig.apiKeys
                 .filter(([key, enabled]) => key.length > 0 && enabled)
                 .map(([key]) => key)[0] || ''
             const response = await this.post(url, agentRequest, {
                 signal: params.signal,
-                headers: { // 显式加鉴权头（如果 post 方法不自动加）
+                headers: {
                     'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 }
@@ -161,6 +190,9 @@ export class QWenRequester
             for await (const event of iterator) {
                 if (event.type === 'thread.created') {
                     sessionId = JSON.parse(event.data).threadId
+                    if (sessionId) {
+                        this._setSessionId(sessionKey, sessionId)
+                    }
                 } else if (event.type === 'message.delta') {
                     const deltaData = JSON.parse(event.data)
                     const delta = deltaData.content || ''
