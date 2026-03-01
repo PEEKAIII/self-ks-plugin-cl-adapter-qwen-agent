@@ -1,4 +1,5 @@
 import { ChatGenerationChunk } from '@langchain/core/outputs'
+import { AIMessageChunk } from '@langchain/core/messages'
 import { Context } from 'koishi'
 import {
     ChatLunaError,
@@ -170,42 +171,105 @@ export class QWenRequester
                     prompt,
                     session_id: sessionId
                 },
-                parameters: {},
+                parameters: {
+                    incremental_output: true
+                },
                 debug: {}
             }
 
-            const url = `https://dashscope.aliyuncs.com/api/v1/apps/${agentId}/completion`
+            // Agent 2.0 API 使用不同的 base URL
+            // 临时修改 concatUrl 返回正确的 base URL
+            const originalConcatUrl = this.concatUrl.bind(this)
+            this.concatUrl = (url: string) => `https://dashscope.aliyuncs.com/api/v1/apps/${agentId}/${url}`
+
             const apiKey = this._pluginConfig.apiKeys
                 .filter(([key, enabled]) => key.length > 0 && enabled)
                 .map(([key]) => key)[0] || ''
-            const response = await this.post(url, agentRequest, {
-                signal: params.signal,
-                headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
-                }
-            })
 
-            const iterator = sseIterable(response)
-            for await (const event of iterator) {
-                if (event.type === 'thread.created') {
-                    sessionId = JSON.parse(event.data).threadId
-                    if (sessionId) {
-                        this._setSessionId(sessionKey, sessionId)
+            try {
+                const response = await this.post('completion', agentRequest, {
+                    signal: params.signal,
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/json',
+                        'X-DashScope-SSE': 'enable'
                     }
-                } else if (event.type === 'message.delta') {
-                    const deltaData = JSON.parse(event.data)
-                    const delta = deltaData.content || ''
-                    const chunk = {
-                        choices: [{ delta: { content: delta } }],
-                        generationInfo: { sessionId }
-                    } as unknown as ChatGenerationChunk
+                })
+
+                // 恢复原始 concatUrl
+                this.concatUrl = originalConcatUrl
+
+                // Agent 2.0：将阿里云格式转换为 OpenAI 格式，然后复用 processStreamResponse
+                const rawIterator = sseIterable(response)
+
+                // 创建转换后的迭代器：阿里云格式 → OpenAI 格式
+                async function* convertIterator() {
+                    for await (const event of rawIterator) {
+                        // 跳过非数据事件
+                        if (!event.data) continue
+
+                        try {
+                            const parsed = JSON.parse(event.data)
+
+                            // 处理错误响应
+                            if (parsed.code && parsed.code !== '') {
+                                throw new Error(`${parsed.code}: ${parsed.message}`)
+                            }
+
+                            // 转换为 OpenAI 格式
+                            if (parsed.output) {
+                                // 提取 session_id
+                                if (parsed.output.session_id && !sessionId) {
+                                    sessionId = parsed.output.session_id
+                                    this._setSessionId(sessionKey, sessionId)
+                                }
+
+                                // 转换为 OpenAI SSE 格式
+                                const openAIEvent = {
+                                    data: JSON.stringify({
+                                        id: parsed.request_id || `chatcmpl-${Date.now()}`,
+                                        object: 'chat.completion.chunk',
+                                        created: Math.floor(Date.now() / 1000),
+                                        model: 'aliyun-agent-2.0',
+                                        choices: [{
+                                            index: 0,
+                                            delta: {
+                                                content: parsed.output.text || '',
+                                                role: 'assistant'
+                                            },
+                                            finish_reason: parsed.output.finish_reason === 'stop' ? 'stop' : null
+                                        }]
+                                    })
+                                }
+                                yield openAIEvent
+
+                                // 检查是否结束
+                                if (parsed.output.finish_reason === 'stop') {
+                                    break
+                                }
+                            }
+                        } catch (e) {
+                            if (e instanceof SyntaxError) {
+                                this.ctx.logger('chatluna-qwen-agent').warn(`Failed to parse SSE data: ${event.data}`)
+                                continue
+                            }
+                            throw e
+                        }
+                    }
+                }
+
+                // 使用 bind 确保 this 指向正确
+                const boundConvertIterator = convertIterator.bind(this)
+
+                // 复用 processStreamResponse 处理转换后的 OpenAI 格式
+                const streamChunks = processStreamResponse(requestContext, boundConvertIterator())
+
+                for await (const chunk of streamChunks) {
                     yield chunk
                 }
-                else if (event.type === 'run.failed') {
-                    const errorData = JSON.parse(event.data)
-                    throw new ChatLunaError(ChatLunaErrorCode.API_REQUEST_FAILED, errorData.message)
-                }
+            } finally {
+                // 确保 concatUrl 被恢复
+                this.concatUrl = originalConcatUrl
             }
         } catch (e) {
             if (e instanceof ChatLunaError) {
